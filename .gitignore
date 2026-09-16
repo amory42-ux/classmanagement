@@ -1,0 +1,17 @@
+# OS Generated files
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary / Log files
+*.log
+node_modules/
+dist/
