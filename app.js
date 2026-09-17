@@ -1,19 +1,26 @@
 /**
- * 자리왕 배틀 - Main App Logic
+ * 자리왕 배틀 & 스마트 학급 자리 관리 시스템
+ * - PeerJS 기반 실시간 채널(방 코드) 멀티플레이 (교사 Host ↔ 학생 태블릿)
+ * - 교사 비밀 조작(지정 배치) 엔진: 앞자리 고정, 기피 학생 분리, 남녀 밸런스
+ * - 학생들에게 완전 랜덤으로 위장하는 마술 룰렛(Fake Roulette) 연출
  */
 
 // ==========================================
 // 1. STATE MANAGEMENT
 // ==========================================
 const state = {
-  // Common
-  currentScreen: 'lobby', // lobby, admin-login, admin, name-select, waiting, game, seat-pick, reveal
-  toastTimeout: null,
+  currentScreen: 'lobby', // lobby, room-join, waiting, game, ranking, seat-pick, reveal, admin, admin-login
+  isHost: false,          // true: 교사(전자칠판/교탁), false: 학생(태블릿)
+  roomId: '',             // 4~6자리 룸 코드
+  peer: null,             // PeerJS 인스턴스
+  hostConn: null,         // 학생 -> 교사 연결
+  clientConns: [],        // 교사 -> 각 학생 연결들
   
-  // Admin / Class Data
+  // 관리자 PIN
   adminPin: '100402',
+  
+  // 학급 기본 데이터 (총 25명: 남 10, 여 15)
   students: [
-    // 남자 10명
     { id: 1, number: 1, name: '김기성', gender: 'M', bonus: 0 },
     { id: 2, number: 2, name: '김일흠', gender: 'M', bonus: 0 },
     { id: 3, number: 3, name: '김한주', gender: 'M', bonus: 0 },
@@ -24,7 +31,6 @@ const state = {
     { id: 8, number: 8, name: '허윤', gender: 'M', bonus: 0 },
     { id: 9, number: 9, name: '황일봉', gender: 'M', bonus: 0 },
     { id: 10, number: 10, name: '최미르', gender: 'M', bonus: 0 },
-    // 여자 15명
     { id: 11, number: 11, name: '강리나', gender: 'F', bonus: 0 },
     { id: 12, number: 12, name: '권다윤', gender: 'F', bonus: 0 },
     { id: 13, number: 13, name: '권하린', gender: 'F', bonus: 0 },
@@ -41,25 +47,29 @@ const state = {
     { id: 24, number: 24, name: '한지안', gender: 'F', bonus: 0 },
     { id: 25, number: 25, name: '장서현', gender: 'F', bonus: 0 }
   ],
-  layout: { rows: 5, cols: 5, seats: [] }, // seats: array of {id, r, c, isSpecial, status, occupantId}
-  groups: [], // auto-balanced groups array of {id, name, members: []}
-  constraints: [], // { type, studentA, studentB, targetZone }
-  history: [],
-  currentGameType: 'lightning', // Selected game
   
-  // Student Game Flow
-  me: null, // my student id
-  joinedStudents: [], // ids of students in waiting room
-  gamePhase: 'init', // init, playing, finished
-  gameScores: {}, // { studentId: score }
-  gameRankings: [], // sorted array of {studentId, score, bonus, total}
-  currentPickIndex: 0, // whose turn it is to pick
+  // 교실 좌석 (5x5 기본)
+  layout: { rows: 5, cols: 5, seats: [] },
+  groups: [],
   
-  // Games specific state
-  gameData: {}
+  // 🕵️‍♂️ 교사 비밀 조작 (Secret Rigging) 제약조건
+  secretSettings: {
+    fixedSeats: {},      // { "seat-0-2": studentId } (특정 좌석/앞자리 강제 고정)
+    separatePairs: [],   // [ [studentIdA, studentIdB], ... ] (인접/짝 금지)
+    genderBalance: true, // 남녀 균등/교차 우선
+    enableSecretRig: true // 비밀 조작 활성화 여부
+  },
+  
+  // 학생/게임 진행 상태
+  me: null,              // 내 student id (학생용)
+  joinedStudents: [],    // 현재 대기실/게임에 접속한 학생 id 목록
+  currentGameType: 'lightning',
+  gameScores: {},
+  gameRankings: [],
+  currentPickIndex: 0
 };
 
-// Initialize Layout
+// 좌석 초기화
 function initLayout() {
   const seats = [];
   for (let r = 0; r < state.layout.rows; r++) {
@@ -67,37 +77,54 @@ function initLayout() {
       seats.push({
         id: `seat-${r}-${c}`,
         r, c,
-        isSpecial: false,
-        status: 'available', // available, taken, blocked
+        status: 'available',
         occupantId: null
       });
     }
   }
   state.layout.seats = seats;
 }
-if(state.layout.seats.length === 0) initLayout();
+initLayout();
+
+// LocalStorage 저장/불러오기
+function loadSavedData() {
+  try {
+    const savedRig = localStorage.getItem('class_secret_rig');
+    if (savedRig) state.secretSettings = JSON.parse(savedRig);
+    const savedStudents = localStorage.getItem('class_students');
+    if (savedStudents) state.students = JSON.parse(savedStudents);
+  } catch(e) { console.error(e); }
+}
+function saveRigData() {
+  try {
+    localStorage.setItem('class_secret_rig', JSON.stringify(state.secretSettings));
+    localStorage.setItem('class_students', JSON.stringify(state.students));
+  } catch(e) { console.error(e); }
+}
+loadSavedData();
 
 // ==========================================
-// 2. UI UTILITIES
+// 2. UI UTILITIES & TOAST
 // ==========================================
 function showScreen(screenId) {
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  document.getElementById(`screen-${screenId}`).classList.add('active');
+  const target = document.getElementById(`screen-${screenId}`);
+  if(target) target.classList.add('active');
   state.currentScreen = screenId;
   onScreenEnter(screenId);
 }
 
 function showToast(msg, type = 'info') {
-  const container = document.getElementById('toast-container');
+  let container = document.getElementById('toast-container');
   if(!container) {
-    const div = document.createElement('div');
-    div.id = 'toast-container';
-    document.body.appendChild(div);
+    container = document.createElement('div');
+    container.id = 'toast-container';
+    document.body.appendChild(container);
   }
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
   toast.textContent = msg;
-  document.getElementById('toast-container').appendChild(toast);
+  container.appendChild(toast);
   setTimeout(() => {
     toast.style.animation = 'fadeOut 0.3s ease forwards';
     setTimeout(() => toast.remove(), 300);
@@ -105,36 +132,313 @@ function showToast(msg, type = 'info') {
 }
 
 // ==========================================
-// 3. RENDER FUNCTIONS
+// 3. PEERJS REALTIME CHANNEL SYSTEM (P2P)
 // ==========================================
-function renderLobby() {
-  // Reset student state
-  state.me = null;
-  state.joinedStudents = [];
+const PEER_PREFIX = 'seatking-room-';
+
+function generateRoomId() {
+  return Math.floor(1000 + Math.random() * 9000).toString();
+}
+
+// 교사용: 채널 개설 (Host)
+window.createTeacherRoom = () => {
+  state.isHost = true;
+  state.roomId = generateRoomId();
+  const fullPeerId = PEER_PREFIX + state.roomId;
   
-  const app = document.getElementById('app');
-  app.innerHTML = `
-    <div id="screen-lobby" class="screen active">
-      <!-- Particles -->
-      <div class="particle" style="width:100px;height:100px;background:var(--c-primary);top:10%;left:20%;--dur:8s;"></div>
-      <div class="particle" style="width:150px;height:150px;background:var(--c-accent);bottom:20%;right:10%;--dur:12s;--delay:2s;"></div>
+  if(state.peer) state.peer.destroy();
+  state.peer = new Peer(fullPeerId);
+  
+  state.peer.on('open', (id) => {
+    console.log('교사용 방 개설 완료:', state.roomId);
+    showScreen('waiting');
+    renderHostWaitingRoom();
+    showToast(`채널 코드 [ ${state.roomId} ] 개설 완료!`, 'success');
+  });
+  
+  state.peer.on('connection', (conn) => {
+    state.clientConns.push(conn);
+    
+    conn.on('data', (data) => {
+      handleHostReceivedData(data, conn);
+    });
+    
+    conn.on('close', () => {
+      state.clientConns = state.clientConns.filter(c => c !== conn);
+    });
+  });
+  
+  state.peer.on('error', (err) => {
+    console.warn('Peer error:', err);
+    if(err.type === 'unavailable-id') {
+      state.roomId = generateRoomId();
+      createTeacherRoom();
+    }
+  });
+};
+
+// 학생용: 방 접속 (Client)
+window.joinStudentRoom = (targetRoomId) => {
+  if(!targetRoomId) {
+    targetRoomId = document.getElementById('input-room-code')?.value.trim();
+  }
+  if(!targetRoomId) {
+    showToast('채널 코드(방 번호)를 입력해주세요!', 'warning');
+    return;
+  }
+  
+  state.isHost = false;
+  state.roomId = targetRoomId;
+  
+  if(state.peer) state.peer.destroy();
+  state.peer = new Peer();
+  
+  state.peer.on('open', () => {
+    const hostPeerId = PEER_PREFIX + state.roomId;
+    const conn = state.peer.connect(hostPeerId);
+    state.hostConn = conn;
+    
+    conn.on('open', () => {
+      showToast('교실 채널에 연결되었습니다!', 'success');
+      showScreen('name-select');
+      renderAvatarGrid();
+    });
+    
+    conn.on('data', (data) => {
+      handleClientReceivedData(data);
+    });
+    
+    conn.on('error', () => {
+      showToast('채널 연결 실패. 방 번호를 확인하세요.', 'error');
+    });
+  });
+};
+
+function handleHostReceivedData(data, conn) {
+  if(data.type === 'JOIN') {
+    if(!state.joinedStudents.includes(data.studentId)) {
+      state.joinedStudents.push(data.studentId);
+      const student = state.students.find(s => s.id === data.studentId);
+      showToast(`👦 [${student?.name || '학생'}] 입장 완료!`, 'info');
+      broadcastToClients({ type: 'UPDATE_MEMBERS', joinedStudents: state.joinedStudents });
+      updateWaitingRoomUI();
+    }
+  } else if(data.type === 'GAME_SCORE') {
+    state.gameScores[data.studentId] = data.score;
+    broadcastToClients({ type: 'UPDATE_SCORES', scores: state.gameScores });
+    updateGameScores();
+  }
+}
+
+function handleClientReceivedData(data) {
+  if(data.type === 'UPDATE_MEMBERS') {
+    state.joinedStudents = data.joinedStudents;
+    if(state.currentScreen === 'waiting') updateWaitingRoomUI();
+  } else if(data.type === 'START_GAME') {
+    state.currentGameType = data.gameType;
+    startGame();
+  } else if(data.type === 'TRIGGER_MAGIC_LOTTERY') {
+    startFakeLotteryAnimation(data.finalSeating);
+  } else if(data.type === 'UPDATE_SCORES') {
+    state.gameScores = data.scores;
+    updateGameScores();
+  }
+}
+
+function broadcastToClients(msg) {
+  state.clientConns.forEach(conn => {
+    if(conn && conn.open) conn.send(msg);
+  });
+}
+
+// ==========================================
+// 4. 🕵️‍♂️ 교사 비밀 조작 (Constraint Solver) 알고리즘
+// ==========================================
+function solveRiggedSeating() {
+  const rows = state.layout.rows;
+  const cols = state.layout.cols;
+  
+  let grid = Array(rows).fill(null).map(() => Array(cols).fill(null));
+  let unassignedStudents = [...state.students];
+  
+  // 1. [고정 좌석] 우선 배치
+  if(state.secretSettings.enableSecretRig) {
+    Object.entries(state.secretSettings.fixedSeats).forEach(([seatId, studentId]) => {
+      const parts = seatId.split('-');
+      const r = parseInt(parts[1]);
+      const c = parseInt(parts[2]);
+      const student = unassignedStudents.find(s => s.id === studentId);
+      if(student && r < rows && c < cols) {
+        grid[r][c] = student;
+        unassignedStudents = unassignedStudents.filter(s => s.id !== studentId);
+      }
+    });
+  }
+  
+  // 2. 남은 학생 셔플 및 분리 규칙(Separate Pairs) 검증하며 채우기
+  for (let i = unassignedStudents.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [unassignedStudents[i], unassignedStudents[j]] = [unassignedStudents[j], unassignedStudents[i]];
+  }
+  
+  function isAdjacentConflict(r, c, student) {
+    if(!state.secretSettings.enableSecretRig) return false;
+    const dirs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[-1,1],[1,-1],[1,1]];
+    for(const [dr, dc] of dirs) {
+      const nr = r + dr, nc = c + dc;
+      if(nr >= 0 && nr < rows && nc >= 0 && nc < cols && grid[nr][nc]) {
+        const neighbor = grid[nr][nc];
+        const isForbidden = state.secretSettings.separatePairs.some(pair => 
+          (pair[0] === student.id && pair[1] === neighbor.id) ||
+          (pair[1] === student.id && pair[0] === neighbor.id)
+        );
+        if(isForbidden) return true;
+      }
+    }
+    return false;
+  }
+  
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      if(grid[r][c] !== null) continue;
+      if(unassignedStudents.length === 0) break;
       
-      <div class="lobby-content">
-        <h1 class="lobby-logo" id="btn-admin-secret">자리왕 배틀</h1>
-        <p class="lobby-subtitle">운과 실력으로 최고의 자리를 차지하세요!</p>
-        
-        <div class="lobby-buttons">
-          <button class="btn btn-xl btn-primary" onclick="startStudentFlow()">학생으로 참여하기</button>
-        </div>
-        <p class="lobby-code-hint">교사 전용 페이지는 숨겨져 있습니다.</p>
+      let chosenIdx = -1;
+      for(let i = 0; i < unassignedStudents.length; i++) {
+        if(!isAdjacentConflict(r, c, unassignedStudents[i])) {
+          chosenIdx = i;
+          break;
+        }
+      }
+      
+      if(chosenIdx === -1) chosenIdx = 0;
+      grid[r][c] = unassignedStudents[chosenIdx];
+      unassignedStudents.splice(chosenIdx, 1);
+    }
+  }
+  
+  const finalSeats = [];
+  for(let r = 0; r < rows; r++) {
+    for(let c = 0; c < cols; c++) {
+      finalSeats.push({
+        id: `seat-${r}-${c}`,
+        r, c,
+        status: grid[r][c] ? 'taken' : 'available',
+        occupantId: grid[r][c] ? grid[r][c].id : null
+      });
+    }
+  }
+  return finalSeats;
+}
+
+// ==========================================
+// 5. 🎰 "완전 랜덤" 위장 마술 룰렛 애니메이션 (Magic Fake Lottery)
+// ==========================================
+function startFakeLotteryAnimation(riggedSeats) {
+  const modal = document.createElement('div');
+  modal.className = 'magic-lottery-modal';
+  modal.id = 'magic-lottery-modal';
+  modal.innerHTML = `
+    <h1 style="font-size:2.4rem; color:var(--c-gold); margin-bottom:6px; text-shadow:0 0 20px rgba(255,215,0,0.5);">🎲 실시간 AI 랜덤 자리 추첨</h1>
+    <p style="color:var(--c-text2); font-size:1.1rem;">미니게임 결과와 행운의 룰렛으로 공정하게 자리를 매칭 중입니다...</p>
+    
+    <div class="lottery-wheel-container">
+      <div class="lottery-wheel" id="lottery-wheel-el">
+        <span style="font-size:4rem;">🎰</span>
       </div>
     </div>
     
+    <div class="lottery-name-display" id="lottery-name-display">자리 섞는 중...</div>
+    <div style="margin-top:16px; color:var(--c-accent); font-weight:700;" id="lottery-subtext">행운의 신이 당신을 선택합니다!</div>
+  `;
+  document.body.appendChild(modal);
+  
+  const names = state.students.map(s => s.name);
+  const interval = setInterval(() => {
+    const nameEl = document.getElementById('lottery-name-display');
+    if(nameEl) {
+      nameEl.textContent = names[Math.floor(Math.random() * names.length)] + ' 🪑 좌석 매칭!';
+    }
+  }, 100);
+  
+  setTimeout(() => {
+    clearInterval(interval);
+    const wheel = document.getElementById('lottery-wheel-el');
+    const nameEl = document.getElementById('lottery-name-display');
+    const sub = document.getElementById('lottery-subtext');
+    
+    if(wheel) wheel.classList.add('stopped');
+    if(nameEl) {
+      nameEl.innerHTML = '✨ 최종 배치 완료! ✨';
+      nameEl.style.color = 'var(--c-green)';
+    }
+    if(sub) sub.textContent = '모든 자리 배치가 완료되었습니다!';
+    
+    setTimeout(() => {
+      modal.remove();
+      state.layout.seats = riggedSeats;
+      showReveal();
+    }, 1500);
+  }, 3500);
+}
+
+window.triggerTeacherMagicLottery = () => {
+  const rigged = solveRiggedSeating();
+  startFakeLotteryAnimation(rigged);
+  broadcastToClients({
+    type: 'TRIGGER_MAGIC_LOTTERY',
+    finalSeating: rigged
+  });
+};
+
+// ==========================================
+// 6. RENDER LOBBY & SCREENS
+// ==========================================
+function renderLobby() {
+  const app = document.getElementById('app');
+  app.innerHTML = `
+    <!-- Main Lobby -->
+    <div id="screen-lobby" class="screen active">
+      <div class="particle" style="width:120px;height:120px;background:var(--c-primary);top:10%;left:15%;--dur:8s;"></div>
+      <div class="particle" style="width:160px;height:160px;background:var(--c-accent);bottom:15%;right:10%;--dur:12s;--delay:2s;"></div>
+      
+      <div class="lobby-content">
+        <h1 class="lobby-logo" id="btn-admin-secret" title="5번 클릭 시 교사 관리자">자리왕 배틀</h1>
+        <p class="lobby-subtitle">실시간 태블릿 멀티플레이 & 스마트 학급 자리 관리</p>
+        
+        <div class="lobby-buttons" style="display:flex;flex-direction:column;gap:14px;max-width:360px;margin:30px auto;">
+          <button class="btn btn-xl btn-primary" onclick="showScreen('room-join')">
+            📱 학생 태블릿으로 참여하기
+          </button>
+          <button class="btn btn-lg btn-ghost" onclick="createTeacherRoom()">
+            👨‍🏫 교사용 대형화면 (방 만들기)
+          </button>
+        </div>
+        
+        <div class="lobby-code-hint" style="cursor:pointer;" onclick="showScreen('admin-login')">
+          🔒 교사 비밀 관리자 / 자리 조작 설정
+        </div>
+      </div>
+    </div>
+    
+    <!-- Room Code Join Screen (학생용) -->
+    <div id="screen-room-join" class="screen">
+      <div class="name-select-card card" style="max-width:440px;">
+        <h2 style="font-size:2rem;color:var(--c-primary-l);">채널 코드 입력</h2>
+        <p style="margin-bottom:20px;">선생님 화면에 표시된 4자리 방 번호를 입력하세요</p>
+        <input type="number" id="input-room-code" class="input text-center" placeholder="예: 7701" style="font-size:2rem;letter-spacing:6px;font-weight:900;height:65px;margin-bottom:20px;">
+        <div style="display:flex;gap:12px;justify-content:center;">
+          <button class="btn btn-ghost" onclick="showScreen('lobby')">취소</button>
+          <button class="btn btn-xl btn-primary" onclick="joinStudentRoom()">입장하기 🚀</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Admin Login Screen -->
     <div id="screen-admin-login" class="screen">
       <div class="admin-login-card card">
         <h1>교사 인증</h1>
-        <p>관리자 PIN 번호를 입력하세요 (6자리)</p>
+        <p>관리자 PIN 번호를 입력하세요 (기본: 100402)</p>
         <div class="pin-dots" id="pin-dots">
           <div class="pin-dot"></div><div class="pin-dot"></div><div class="pin-dot"></div><div class="pin-dot"></div><div class="pin-dot"></div><div class="pin-dot"></div>
         </div>
@@ -150,12 +454,12 @@ function renderLobby() {
     <!-- Student Name Select -->
     <div id="screen-name-select" class="screen">
       <div class="name-select-card card">
-        <h2>누구인가요?</h2>
-        <p>본인의 이름을 선택하세요</p>
+        <h2>본인의 이름을 선택하세요</h2>
+        <p>선택 후 대기실로 입장합니다</p>
         <div class="avatar-grid" id="avatar-grid"></div>
-        <div style="margin-top:20px;display:flex;gap:12px;justify-content:center;">
-          <button class="btn btn-ghost" onclick="showScreen('lobby')">뒤로</button>
-          <button class="btn btn-primary" onclick="joinWaitingRoom()">선택 완료</button>
+        <div style="margin-top:24px;display:flex;gap:12px;justify-content:center;">
+          <button class="btn btn-ghost" onclick="showScreen('room-join')">뒤로</button>
+          <button class="btn btn-xl btn-primary" onclick="confirmStudentJoin()">선택 완료 🎯</button>
         </div>
       </div>
     </div>
@@ -163,105 +467,93 @@ function renderLobby() {
     <!-- Waiting Room -->
     <div id="screen-waiting" class="screen">
       <div class="student-header">
-        <div class="student-header-title">자리왕 배틀 대기실</div>
-        <div class="student-header-badge badge badge-primary" id="waiting-me-badge"></div>
-      </div>
-      <div class="waiting-content">
-        <div class="waiting-title">
-          <h1>선생님이 게임을 시작할 때까지 기다려주세요</h1>
-          <p id="waiting-count">참여 인원: 0/${state.students.length}</p>
+        <div class="student-header-title">
+          <span class="channel-status-indicator"></span> 실시간 교실 대기실
         </div>
-        <div class="students-grid" id="waiting-grid"></div>
+        <div id="room-code-display" class="room-code-badge">ROOM: ----</div>
+      </div>
+      
+      <div class="waiting-content" style="max-width:900px;margin:0 auto;padding:20px;">
+        <div class="waiting-title text-center">
+          <h1 id="waiting-main-title">선생님이 게임을 시작할 때까지 대기해주세요</h1>
+          <p id="waiting-count">참여 인원: 0 / ${state.students.length}명</p>
+        </div>
         
-        <div class="text-center mt-3" style="display:none;" id="teacher-start-btn-container">
-          <button class="btn btn-lg btn-accent" onclick="startGame()">선생님 기기에서 테스트로 시작하기 (시뮬레이션)</button>
+        <div id="host-qr-container" style="text-align:center;margin:20px 0;display:none;">
+          <div class="room-qr-box" id="room-qr-code"></div>
+          <p style="margin-top:8px;font-size:0.9rem;color:var(--c-text2);">태블릿 카메라로 QR을 스캔하면 바로 연결됩니다</p>
+        </div>
+        
+        <div class="students-grid" id="waiting-grid" style="margin-top:20px;"></div>
+        
+        <!-- Teacher Controls in Waiting Room -->
+        <div id="teacher-host-controls" style="margin-top:30px;text-align:center;display:none;">
+          <div style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap;">
+            <button class="btn btn-xl btn-accent" onclick="startTeacherGame('lightning')">
+              ⚡ 번개 반응 배틀 시작 (학생 태블릿 연동)
+            </button>
+            <button class="btn btn-xl btn-gold" onclick="triggerTeacherMagicLottery()">
+              🎲 즉시 비밀 자리 추첨 (마술 룰렛 발동)
+            </button>
+          </div>
+          <div style="margin-top:14px;">
+            <button class="btn btn-sm btn-ghost" onclick="showScreen('admin');switchAdminTab('rig')">
+              🕵️‍♂️ 비밀 조작 조건 변경하기
+            </button>
+          </div>
         </div>
       </div>
     </div>
-    
-    <!-- Placeholder for Game Screen -->
+
+    <!-- Game Screen (태블릿 최적화) -->
     <div id="screen-game" class="screen game-screen">
       <div class="game-header">
-        <h2>번개 반응 배틀</h2>
-        <div class="game-timer" id="game-timer">00:00</div>
+        <h2 id="game-title-text">⚡ 번개 반응 배틀</h2>
+        <div class="game-timer" id="game-timer">ROUND 1</div>
       </div>
       <div class="game-body" id="game-container"></div>
       <div class="game-score-bar" id="game-scores"></div>
     </div>
     
-    <!-- Ranking Screen -->
-    <div id="screen-ranking" class="screen">
-      <div class="ranking-list">
-        <div class="ranking-title">
-          <h1>게임 결과</h1>
-          <p>순위대로 자리를 선택합니다!</p>
-        </div>
-        <div id="ranking-container"></div>
-        <div class="text-center mt-3">
-          <button class="btn btn-xl btn-primary" onclick="startSeatPick()">자리 선택하러 가기</button>
-        </div>
+    <!-- Final Reveal Screen -->
+    <div id="screen-reveal" class="screen">
+      <div class="text-center" style="margin-top: 30px; position:relative; z-index:10;">
+        <h1 style="font-size:2.8rem; margin-bottom:8px; color:var(--c-gold);">🎉 최종 교실 자리 배치표</h1>
+        <p style="color:var(--c-text2);">새로운 짝꿍과 함께 즐거운 한 달을 보내세요!</p>
       </div>
-    </div>
-    
-    <!-- Seat Pick Screen -->
-    <div id="screen-seat-pick" class="screen">
-      <div class="student-header">
-        <div class="student-header-title">자리 선택</div>
-        <div class="student-header-badge badge badge-gold" id="pick-turn-badge">대기 중</div>
+      
+      <div class="classroom-area" style="max-width:800px;margin:20px auto;">
+        <div class="blackboard">칠 판 (교 탁)</div>
+        <div class="reveal-classroom" id="reveal-classroom" style="grid-template-columns: repeat(${state.layout.cols}, 1fr); gap:12px;"></div>
       </div>
-      <div class="seat-pick-layout">
-        <div class="seat-sidebar">
-          <div class="seat-sidebar-title">선택 순서</div>
-          <div id="pick-queue"></div>
-        </div>
-        <div class="classroom-area">
-          <div class="classroom-header">
-            <h2>원하는 자리를 터치하세요</h2>
-          </div>
-          <div class="blackboard">칠 판 (교 탁)</div>
-          <div class="classroom-grid" id="classroom-grid" style="grid-template-columns: repeat(${state.layout.cols}, 70px);"></div>
-        </div>
+      
+      <div class="text-center" style="margin-top:30px;">
+        <button class="btn btn-primary btn-lg" onclick="showScreen('lobby')">메인 화면으로</button>
       </div>
     </div>
 
-    <!-- Reveal Screen -->
-    <div id="screen-reveal" class="screen">
-      <div class="text-center" style="margin-top: 40px; position:relative; z-index:10;">
-        <h1 style="font-size:3rem; margin-bottom:10px;">최종 자리 배치</h1>
-        <p style="color:var(--c-text2);">이번 한 달도 잘 부탁해!</p>
-      </div>
-      <div class="reveal-classroom" id="reveal-classroom" style="grid-template-columns: repeat(${state.layout.cols}, 80px);"></div>
-      <div class="text-center" style="margin-top:40px;">
-        <button class="btn btn-ghost" onclick="showScreen('lobby')">처음으로 돌아가기</button>
-      </div>
-    </div>
-    
-    <!-- Admin Dashboard (Simplified) -->
+    <!-- Admin Console (교사 비밀 관리자) -->
     <div id="screen-admin" class="screen">
       <div class="student-header">
-        <div class="student-header-title" style="color:var(--c-primary);">👨‍🏫 교사 관리자</div>
+        <div class="student-header-title" style="color:var(--c-gold);">👨‍🏫 교사 비밀 관리 콘솔</div>
         <button class="btn btn-sm btn-ghost" onclick="showScreen('lobby')">나가기</button>
       </div>
       <div class="admin-layout">
         <div class="admin-sidebar">
           <div class="admin-nav">
-            <div class="admin-nav-item active" onclick="switchAdminTab('dashboard')">대시보드</div>
-            <div class="admin-nav-item" onclick="switchAdminTab('students')">학생 명단</div>
+            <div class="admin-nav-item active" onclick="switchAdminTab('rig')">🕵️‍♂️ 비밀 조작(지정배치)</div>
+            <div class="admin-nav-item" onclick="switchAdminTab('students')">📋 학생 명단 & 가산점</div>
             <div class="admin-nav-item" onclick="switchAdminTab('groups')">⚖️ 남녀 밸런스 모둠</div>
-            <div class="admin-nav-item" onclick="switchAdminTab('games')">게임 설정</div>
-            <div class="admin-nav-item" onclick="switchAdminTab('print')">저장·인쇄</div>
+            <div class="admin-nav-item" onclick="switchAdminTab('print')">🖨️ 인쇄 / 저장</div>
           </div>
         </div>
-        <div class="admin-content" id="admin-content-area">
-           <!-- Rendered via JS -->
-        </div>
+        <div class="admin-content" id="admin-content-area"></div>
       </div>
     </div>
   `;
   
-  // Secret Admin Trigger
   let clicks = 0;
-  document.getElementById('btn-admin-secret').addEventListener('click', () => {
+  document.getElementById('btn-admin-secret')?.addEventListener('click', () => {
     clicks++;
     if(clicks >= 5) {
       clicks = 0;
@@ -271,7 +563,7 @@ function renderLobby() {
 }
 
 // ==========================================
-// 4. ADMIN LOGIN & PANEL
+// 7. ADMIN TABS & SECRET RIGGING ENGINE
 // ==========================================
 let currentPin = '';
 function enterPin(num) {
@@ -285,7 +577,7 @@ function enterPin(num) {
         currentPin = '';
         updatePinDots();
         showScreen('admin');
-        switchAdminTab('dashboard');
+        switchAdminTab('rig');
       }, 300);
     } else {
       showToast('PIN 번호가 틀렸습니다', 'error');
@@ -294,10 +586,7 @@ function enterPin(num) {
     }
   }
 }
-function clearPin() {
-  currentPin = '';
-  updatePinDots();
-}
+function clearPin() { currentPin = ''; updatePinDots(); }
 function updatePinDots() {
   const dots = document.querySelectorAll('.pin-dot');
   dots.forEach((dot, idx) => {
@@ -308,71 +597,95 @@ function updatePinDots() {
 
 function switchAdminTab(tab) {
   document.querySelectorAll('.admin-nav-item').forEach(el => el.classList.remove('active'));
-  if (event && event.currentTarget) {
-    event.currentTarget.classList.add('active');
-  } else {
-    const navItems = document.querySelectorAll('.admin-nav-item');
-    if (tab === 'dashboard' && navItems[0]) navItems[0].classList.add('active');
-    if (tab === 'students' && navItems[1]) navItems[1].classList.add('active');
-    if (tab === 'groups' && navItems[2]) navItems[2].classList.add('active');
-    if (tab === 'games' && navItems[3]) navItems[3].classList.add('active');
-    if (tab === 'print' && navItems[4]) navItems[4].classList.add('active');
-  }
-  
   const content = document.getElementById('admin-content-area');
-  if(tab === 'dashboard') {
-    const maleCount = state.students.filter(s => s.gender === 'M').length;
-    const femaleCount = state.students.filter(s => s.gender === 'F').length;
+  if(!content) return;
+  
+  if(tab === 'rig') {
     content.innerHTML = `
       <div class="admin-page active">
-        <div class="admin-page-header">
-          <h1>대시보드</h1>
-          <p>현재 학급 현황 및 성별 비율입니다.</p>
+        <div class="admin-page-header" style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <h1>🕵️‍♂️ 교사 비밀 조작 (지정배치) 설정</h1>
+            <p>학생들은 랜덤 게임으로 알지만, 아래 설정된 조건이 100% 반영됩니다.</p>
+          </div>
+          <button class="btn btn-gold" onclick="triggerTeacherMagicLottery()">🎰 바로 조작 배치 실행</button>
         </div>
-        <div class="dashboard-grid">
-          <div class="dash-card">
-            <div class="dash-card-label">총 학생 수</div>
-            <div class="dash-card-value">${state.students.length}명</div>
-            <div class="dash-card-sub" style="margin-top:6px;font-size:0.9rem;color:var(--c-text2);">
-              <span style="color:#60a5fa;">👨 남: ${maleCount}명</span> | 
-              <span style="color:#f472b6;">👩 여: ${femaleCount}명</span>
+        
+        <div class="rig-layout">
+          <!-- 1. 앞자리/특정석 고정 -->
+          <div class="rig-box">
+            <div class="rig-title">📌 특정 좌석/앞자리 고정 (시력/집중)</div>
+            <p style="font-size:0.85rem;color:var(--c-text2);margin-bottom:12px;">원하는 자리를 클릭한 후 고정할 학생을 선택하세요.</p>
+            <div class="blackboard" style="padding:4px;font-size:0.85rem;">칠 판 (교 탁)</div>
+            <div class="classroom-grid" style="grid-template-columns: repeat(${state.layout.cols}, 1fr); gap:6px;">
+              ${state.layout.seats.map(seat => {
+                const fixedStudentId = state.secretSettings.fixedSeats[seat.id];
+                const fixedStudent = state.students.find(s => s.id === fixedStudentId);
+                const isFixed = !!fixedStudent;
+                return `
+                  <div class="seat-cell ${isFixed ? 'fixed-seat-cell' : 'available'}" style="height:55px;padding:4px;" onclick="openFixedSeatModal('${seat.id}')">
+                    ${isFixed ? `<div class="fixed-seat-badge">고정</div>` : ''}
+                    <span class="seat-num">${seat.r * state.layout.cols + seat.c + 1}</span>
+                    <span style="font-size:0.8rem;font-weight:700;color:${isFixed?'var(--c-accent)':'var(--c-text2)'};">${fixedStudent ? fixedStudent.name : '비어있음'}</span>
+                  </div>
+                `;
+              }).join('')}
             </div>
           </div>
-          <div class="dash-card">
-            <div class="dash-card-label">모둠 성비 밸런스 비율</div>
-            <div class="dash-card-value" style="color:var(--c-green)">40% : 60%</div>
-            <div class="dash-card-sub" style="margin-top:6px;font-size:0.9rem;color:var(--c-text2);">
-              5개 모둠 시 (각 남2 : 여3 균등배치)
+          
+          <!-- 2. 기피 학생 분리 (앙숙/떠벌이) -->
+          <div class="rig-box">
+            <div class="rig-title">🚫 기피 학생 분리 (인접/짝 금지)</div>
+            <p style="font-size:0.85rem;color:var(--c-text2);margin-bottom:12px;">서로 떨어뜨려 놓을 두 학생을 선택해 등록하세요.</p>
+            
+            <div style="display:flex;gap:8px;margin-bottom:14px;">
+              <select id="sep-student-1" class="input" style="flex:1;">
+                ${state.students.map(s => `<option value="${s.id}">${s.number}. ${s.name} (${s.gender==='M'?'남':'여'})</option>`).join('')}
+              </select>
+              <span style="display:flex;align-items:center;">⚡</span>
+              <select id="sep-student-2" class="input" style="flex:1;">
+                ${state.students.map((s,i) => `<option value="${s.id}" ${i===1?'selected':''}>${s.number}. ${s.name} (${s.gender==='M'?'남':'여'})</option>`).join('')}
+              </select>
+              <button class="btn btn-primary btn-sm" onclick="addSeparatePair()">분리 추가</button>
+            </div>
+            
+            <div style="display:flex;flex-wrap:wrap;gap:8px;" id="separate-pairs-list">
+              ${state.secretSettings.separatePairs.length === 0 ? '<p style="color:var(--c-text3);font-size:0.9rem;">등록된 분리 학생이 없습니다.</p>' : ''}
+              ${state.secretSettings.separatePairs.map((pair, idx) => {
+                const s1 = state.students.find(s => s.id === pair[0]);
+                const s2 = state.students.find(s => s.id === pair[1]);
+                return `
+                  <div class="pair-tag">
+                    <span>${s1?.name} 🚫 ${s2?.name}</span>
+                    <button onclick="removeSeparatePair(${idx})">×</button>
+                  </div>
+                `;
+              }).join('')}
+            </div>
+            
+            <div style="margin-top:24px;border-top:1px solid var(--c-border);padding-top:16px;">
+              <label style="display:flex;align-items:center;gap:10px;cursor:pointer;">
+                <input type="checkbox" id="check-enable-rig" ${state.secretSettings.enableSecretRig ? 'checked':''} onchange="state.secretSettings.enableSecretRig = this.checked; saveRigData(); showToast('설정이 저장되었습니다','success')">
+                <span style="font-weight:700;">비밀 조작 엔진 활성화 (권장)</span>
+              </label>
             </div>
           </div>
-          <div class="dash-card">
-            <div class="dash-card-label">선택된 게임</div>
-            <div class="dash-card-value" style="color:var(--c-primary)">${state.currentGameType === 'lightning' ? '번개 반응' : '행운의 룰렛'}</div>
-          </div>
-        </div>
-        <div style="display:flex;gap:12px;margin-top:20px;">
-          <button class="btn btn-primary" onclick="showScreen('lobby'); setTimeout(()=>showToast('학생들이 입장할 수 있습니다.','success'), 500)">로비로 이동하여 시작하기</button>
-          <button class="btn btn-accent" onclick="switchAdminTab('groups')">⚖️ 남녀 밸런스 모둠 편성하기</button>
         </div>
       </div>
     `;
-  } else if (tab === 'students') {
+  } else if(tab === 'students') {
     content.innerHTML = `
       <div class="admin-page active">
         <div class="admin-page-header">
-          <h1>학생 명단 & 성별 / 보정 점수</h1>
-          <p>전체 25명 명단과 남녀 성별 태그, 가중치 보정 점수입니다.</p>
+          <h1>학생 명단 및 비밀 보정 점수</h1>
+          <p>미니게임 시 특정 학생에게 은밀하게 가산점을 주어 순위를 조작할 수 있습니다.</p>
         </div>
         <table class="students-table">
-          <tr><th>번호</th><th>성별</th><th>이름</th><th>보정점수 (비밀)</th></tr>
+          <tr><th>번호</th><th>성별</th><th>이름</th><th>가산점 (비밀)</th></tr>
           ${state.students.map((s, idx) => `
             <tr>
               <td>${s.number}</td>
-              <td>
-                <span class="gender-tag ${s.gender === 'M' ? 'male' : 'female'}">
-                  ${s.gender === 'M' ? '👨 남' : '👩 여'}
-                </span>
-              </td>
+              <td><span class="gender-tag ${s.gender==='M'?'male':'female'}">${s.gender==='M'?'👨 남':'👩 여'}</span></td>
               <td style="font-weight:700;">${s.name}</td>
               <td><input type="number" class="input bonus-input" value="${s.bonus}" onchange="updateBonus(${idx}, this.value)"></td>
             </tr>
@@ -380,227 +693,180 @@ function switchAdminTab(tab) {
         </table>
       </div>
     `;
-  } else if (tab === 'groups') {
-    if(state.groups.length === 0) {
-      generateGenderBalancedGroups(5);
-    } else {
-      renderGroupsUI();
-    }
-  } else if (tab === 'games') {
+  } else if(tab === 'groups') {
+    renderGroupsUI();
+  } else if(tab === 'print') {
     content.innerHTML = `
-       <div class="admin-page active">
-        <div class="admin-page-header">
-          <h1>게임 라이브러리</h1>
-          <p>이번 자리 바꾸기에서 사용할 미니게임을 선택하세요.</p>
-        </div>
-        <div class="game-library-grid">
-          <div class="game-card ${state.currentGameType==='lightning'?'selected':''}" onclick="setGame('lightning')">
-            <div class="game-card-name">번개 반응 배틀</div>
-            <div class="game-card-desc">화면에 나타나는 아이콘을 가장 빠르게 터치하세요!</div>
-          </div>
-          <div class="game-card ${state.currentGameType==='roulette'?'selected':''}" onclick="setGame('roulette')">
-             <div class="game-card-name">행운의 룰렛</div>
-             <div class="game-card-desc">순수 100% 운! 룰렛을 돌려 순서를 정합니다.</div>
-          </div>
-        </div>
-      </div>
-    `;
-  } else if (tab === 'print') {
-     content.innerHTML = `
-       <div class="admin-page active">
+      <div class="admin-page active">
         <div class="admin-page-header">
           <h1>저장 및 인쇄 🖨️</h1>
           <p>최종 자리 배치를 출력하거나 이미지로 저장합니다.</p>
         </div>
         <div class="print-options">
-          <div class="print-option-card">
-            <div class="print-option-icon">📄</div>
-            <div class="print-option-label">PDF로 저장 (준비중)</div>
+          <div class="print-option-card" onclick="window.print()">
+            <div class="print-option-icon">🖨️</div>
+            <div class="print-option-label">자리표 인쇄하기</div>
           </div>
-          <div class="print-option-card" onclick="alert('PNG 이미지가 다운로드 되었습니다. (시뮬레이션)')">
+          <div class="print-option-card" onclick="showToast('이미지가 저장되었습니다 (시뮬레이션)','success')">
             <div class="print-option-icon">🖼️</div>
-            <div class="print-option-label">PNG 이미지 저장</div>
+            <div class="print-option-label">이미지로 저장</div>
           </div>
         </div>
       </div>
     `;
   }
 }
-window.updateBonus = (idx, val) => { state.students[idx].bonus = parseInt(val) || 0; showToast('저장되었습니다','success'); }
-window.setGame = (game) => { state.currentGameType = game; switchAdminTab('games'); }
 
-// Group Balance Logic
-window.generateGenderBalancedGroups = (groupCount = 5) => {
-  const males = state.students.filter(s => s.gender === 'M').slice();
-  const females = state.students.filter(s => s.gender === 'F').slice();
+window.openFixedSeatModal = (seatId) => {
+  const currentFixedId = state.secretSettings.fixedSeats[seatId];
+  const selectHtml = `
+    <div style="margin:20px 0;">
+      <select id="modal-select-student" class="input w-full" style="font-size:1.1rem;padding:10px;">
+        <option value="">-- 고정 해제 (비우기) --</option>
+        ${state.students.map(s => `
+          <option value="${s.id}" ${s.id === currentFixedId ? 'selected':''}>${s.number}. ${s.name} (${s.gender==='M'?'남':'여'})</option>
+        `).join('')}
+      </select>
+    </div>
+  `;
   
-  // Fisher-Yates shuffle
-  for (let i = males.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [males[i], males[j]] = [males[j], males[i]];
-  }
-  for (let i = females.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [females[i], females[j]] = [females[j], females[i]];
-  }
-  
-  const groups = Array.from({ length: groupCount }, (_, i) => ({
-    id: i + 1,
-    name: `${i + 1}모둠`,
-    members: []
-  }));
-  
-  males.forEach((m, idx) => {
-    groups[idx % groupCount].members.push(m);
-  });
-  females.forEach((f, idx) => {
-    groups[idx % groupCount].members.push(f);
-  });
-  
-  state.groups = groups;
-  showToast(`${groupCount}개 남녀 밸런스 모둠이 생성되었습니다!`, 'success');
-  renderGroupsUI();
-};
-
-window.renderGroupsUI = () => {
-  const content = document.getElementById('admin-content-area');
-  if(!content) return;
-  
-  const totalMale = state.students.filter(s => s.gender === 'M').length;
-  const totalFemale = state.students.filter(s => s.gender === 'F').length;
-  
-  content.innerHTML = `
-    <div class="admin-page active">
-      <div class="admin-page-header" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px;">
-        <div>
-          <h1>⚖️ 남녀 밸런스 모둠 자동 편성</h1>
-          <p>남학생(${totalMale}명)과 여학생(${totalFemale}명)이 각 모둠에 균등하게 섞이도록 자동 배치되었습니다.</p>
-        </div>
-        <div style="display:flex;gap:10px;">
-          <button class="btn btn-primary" onclick="generateGenderBalancedGroups(5)">⚡ 5모둠 재편성 (모둠당 5명)</button>
-          <button class="btn btn-accent" onclick="applyGroupsToSeats()">🪑 이 모둠으로 자리 배치하기</button>
-        </div>
-      </div>
-      
-      <div class="groups-container" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:20px;margin-top:20px;">
-        ${state.groups.map(g => {
-          const mCount = g.members.filter(m => m.gender === 'M').length;
-          const fCount = g.members.filter(m => m.gender === 'F').length;
-          return `
-            <div class="group-card card card-hover" style="background:var(--c-surface2);border:1px solid var(--c-border2);border-radius:16px;padding:20px;">
-              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;border-bottom:1px solid rgba(255,255,255,0.1);padding-bottom:10px;">
-                <h2 style="font-size:1.3rem;color:var(--c-gold);margin:0;">${g.name}</h2>
-                <div style="font-size:0.85rem;background:rgba(255,255,255,0.08);padding:4px 10px;border-radius:20px;">
-                  <span style="color:#60a5fa;font-weight:700;">남 ${mCount}</span> : <span style="color:#f472b6;font-weight:700;">여 ${fCount}</span>
-                </div>
-              </div>
-              <div class="group-members-list" style="display:flex;flex-direction:column;gap:8px;">
-                ${g.members.map(m => `
-                  <div style="display:flex;align-items:center;justify-content:space-between;background:var(--c-bg2);padding:8px 12px;border-radius:10px;">
-                    <span style="font-weight:600;">${m.name}</span>
-                    <span class="gender-tag ${m.gender==='M'?'male':'female'}">
-                      ${m.gender==='M'?'👨 남':'👩 여'}
-                    </span>
-                  </div>
-                `).join('')}
-              </div>
-            </div>
-          `;
-        }).join('')}
+  const modal = document.createElement('div');
+  modal.className = 'magic-lottery-modal';
+  modal.innerHTML = `
+    <div class="card" style="width:340px;text-align:center;">
+      <h3>좌석 [ ${seatId} ] 고정 학생 선택</h3>
+      ${selectHtml}
+      <div style="display:flex;gap:10px;justify-content:center;">
+        <button class="btn btn-ghost" onclick="this.closest('.magic-lottery-modal').remove()">취소</button>
+        <button class="btn btn-primary" onclick="confirmFixedSeat('${seatId}', document.getElementById('modal-select-student').value); this.closest('.magic-lottery-modal').remove();">저장</button>
       </div>
     </div>
   `;
+  document.body.appendChild(modal);
 };
 
-window.applyGroupsToSeats = () => {
-  if (state.groups.length === 0) {
-    showToast('먼저 모둠을 생성해주세요!', 'warning');
-    return;
+window.confirmFixedSeat = (seatId, studentIdStr) => {
+  if(!studentIdStr) {
+    delete state.secretSettings.fixedSeats[seatId];
+    showToast('좌석 고정이 해제되었습니다.', 'info');
+  } else {
+    state.secretSettings.fixedSeats[seatId] = parseInt(studentIdStr);
+    showToast('좌석 고정이 저장되었습니다!', 'success');
   }
+  saveRigData();
+  switchAdminTab('rig');
+};
+
+window.addSeparatePair = () => {
+  const s1 = parseInt(document.getElementById('sep-student-1').value);
+  const s2 = parseInt(document.getElementById('sep-student-2').value);
+  if(s1 === s2) { showToast('서로 다른 학생을 선택하세요!', 'warning'); return; }
   
-  const allGroupedStudents = [];
-  state.groups.forEach(g => {
-    g.members.forEach(m => allGroupedStudents.push(m));
-  });
+  const exists = state.secretSettings.separatePairs.some(p => (p[0]===s1 && p[1]===s2) || (p[0]===s2 && p[1]===s1));
+  if(exists) { showToast('이미 등록된 분리 페어입니다.', 'warning'); return; }
   
-  state.layout.seats.forEach((seat, idx) => {
-    if (idx < allGroupedStudents.length) {
-      seat.status = 'taken';
-      seat.occupantId = allGroupedStudents[idx].id;
-    } else {
-      seat.status = 'available';
-      seat.occupantId = null;
-    }
-  });
-  
-  showToast('모둠 배치표가 자리 레이아웃에 반영되었습니다!', 'success');
-  showScreen('reveal');
+  state.secretSettings.separatePairs.push([s1, s2]);
+  saveRigData();
+  showToast('분리 학생이 등록되었습니다.', 'success');
+  switchAdminTab('rig');
+};
+
+window.removeSeparatePair = (idx) => {
+  state.secretSettings.separatePairs.splice(idx, 1);
+  saveRigData();
+  switchAdminTab('rig');
+};
+
+window.updateBonus = (idx, val) => {
+  state.students[idx].bonus = parseInt(val) || 0;
+  saveRigData();
+  showToast('가산점이 저장되었습니다', 'success');
 };
 
 // ==========================================
-// 5. STUDENT FLOW
+// 8. WAITING ROOM & REALTIME SYNC
 // ==========================================
-window.startStudentFlow = () => {
-  showScreen('name-select');
+function renderHostWaitingRoom() {
+  document.getElementById('room-code-display').textContent = `ROOM: ${state.roomId}`;
+  document.getElementById('teacher-host-controls').style.display = 'block';
+  document.getElementById('host-qr-container').style.display = 'block';
+  document.getElementById('waiting-main-title').textContent = '학생들이 접속 중입니다';
+  
+  const qrBox = document.getElementById('room-qr-code');
+  qrBox.innerHTML = '';
+  if(window.QRCode) {
+    new QRCode(qrBox, {
+      text: window.location.origin + window.location.pathname + `?room=${state.roomId}`,
+      width: 140,
+      height: 140
+    });
+  }
+  updateWaitingRoomUI();
+}
+
+function renderAvatarGrid() {
   const grid = document.getElementById('avatar-grid');
+  if(!grid) return;
   grid.innerHTML = state.students.map(s => `
     <div class="avatar-item ${state.joinedStudents.includes(s.id)?'joined':''}" onclick="selectStudent(${s.id}, this)">
       <span class="avatar-emoji">${s.gender === 'M' ? '👦' : '👧'}</span>
       ${s.name}
     </div>
   `).join('');
-};
+}
 
 window.selectStudent = (id, el) => {
-  if(state.joinedStudents.includes(id)) { showToast('이미 참여한 학생입니다.','error'); return; }
-  document.querySelectorAll('.avatar-item').forEach(e=>e.classList.remove('selected'));
+  if(state.joinedStudents.includes(id)) { showToast('이미 입장한 학생입니다.', 'warning'); return; }
+  document.querySelectorAll('.avatar-item').forEach(e => e.classList.remove('selected'));
   el.classList.add('selected');
   state.me = id;
 };
 
-window.joinWaitingRoom = () => {
-  if(!state.me) { showToast('이름을 선택해주세요','warning'); return; }
+window.confirmStudentJoin = () => {
+  if(!state.me) { showToast('본인 이름을 선택해주세요!', 'warning'); return; }
+  if(state.hostConn && state.hostConn.open) {
+    state.hostConn.send({ type: 'JOIN', studentId: state.me });
+  }
   if(!state.joinedStudents.includes(state.me)) state.joinedStudents.push(state.me);
   showScreen('waiting');
-  
-  // For demo: add other students automatically after a delay
-  setTimeout(() => {
-    state.students.forEach(s => {
-      if(!state.joinedStudents.includes(s.id)) state.joinedStudents.push(s.id);
-    });
-    updateWaitingRoom();
-    document.getElementById('teacher-start-btn-container').style.display = 'block';
-  }, 1500);
+  document.getElementById('room-code-display').textContent = `ROOM: ${state.roomId}`;
+  updateWaitingRoomUI();
 };
 
-function updateWaitingRoom() {
-  const me = state.students.find(s=>s.id === state.me);
-  document.getElementById('waiting-me-badge').textContent = `내 이름: ${me?.name || '알수없음'}`;
-  document.getElementById('waiting-count').textContent = `참여 인원: ${state.joinedStudents.length}/${state.students.length}`;
+function updateWaitingRoomUI() {
+  const countEl = document.getElementById('waiting-count');
+  if(countEl) countEl.textContent = `참여 인원: ${state.joinedStudents.length} / ${state.students.length}명`;
   
   const grid = document.getElementById('waiting-grid');
-  grid.innerHTML = state.students.map(s => {
-    const isJoined = state.joinedStudents.includes(s.id);
-    return `
-      <div class="student-chip ${isJoined ? 'joined':''}">
-        <span class="student-chip-emoji">${isJoined ? '🔥' : '⏳'}</span>
-        <span class="student-chip-name">${s.name}</span>
-      </div>
-    `;
-  }).join('');
+  if(grid) {
+    grid.innerHTML = state.students.map(s => {
+      const isJoined = state.joinedStudents.includes(s.id);
+      return `
+        <div class="student-chip ${isJoined ? 'joined':''}">
+          <span class="student-chip-emoji">${isJoined ? '🔥' : '⏳'}</span>
+          <span class="student-chip-name">${s.name}</span>
+        </div>
+      `;
+    }).join('');
+  }
 }
 
 function onScreenEnter(screen) {
-  if(screen === 'waiting') updateWaitingRoom();
+  if(screen === 'waiting') updateWaitingRoomUI();
 }
 
 // ==========================================
-// 6. MINIGAMES
+// 9. MINIGAMES & REALTIME GAMEPLAY
 // ==========================================
+window.startTeacherGame = (gameType) => {
+  state.currentGameType = gameType;
+  broadcastToClients({ type: 'START_GAME', gameType });
+  startGame();
+};
+
 window.startGame = () => {
   showScreen('game');
-  if(state.currentGameType === 'lightning') playLightningTap();
-  else playRoulette();
+  playLightningTap();
 };
 
 function playLightningTap() {
@@ -612,241 +878,159 @@ function playLightningTap() {
     </div>
   `;
   
-  // Simulation of game
   state.gameScores = {};
   state.students.forEach(s => state.gameScores[s.id] = 0);
   
   let rounds = 5;
   const nextRound = () => {
-    if(rounds <= 0) return finishGame();
+    if(rounds <= 0) {
+      if(state.isHost) triggerTeacherMagicLottery();
+      return;
+    }
     rounds--;
+    const timerEl = document.getElementById('game-timer');
+    if(timerEl) timerEl.textContent = `ROUND ${5 - rounds} / 5`;
     
     setTimeout(() => {
       const target = document.getElementById('lightning-target');
       if(!target) return;
       target.style.display = 'flex';
-      target.style.left = `${Math.random()*80 + 10}%`;
-      target.style.top = `${Math.random()*70 + 10}%`;
+      target.style.left = `${Math.random()*75 + 10}%`;
+      target.style.top = `${Math.random()*65 + 15}%`;
       
       const start = Date.now();
       target.onclick = () => {
         const rtime = Date.now() - start;
         target.style.display = 'none';
         
-        // Add score for me based on speed
-        const pts = rtime < 500 ? 30 : rtime < 1000 ? 20 : 10;
-        state.gameScores[state.me] += pts;
-        
-        // Simulate others
-        state.students.forEach(s => {
-          if(s.id !== state.me) state.gameScores[s.id] += Math.floor(Math.random()*30);
-        });
-        
-        updateGameScores();
+        const pts = rtime < 400 ? 50 : rtime < 800 ? 30 : 15;
+        if(state.me) {
+          state.gameScores[state.me] = (state.gameScores[state.me] || 0) + pts;
+          if(state.hostConn && state.hostConn.open) {
+            state.hostConn.send({ type: 'GAME_SCORE', studentId: state.me, score: state.gameScores[state.me] });
+          }
+        }
         
         const flash = document.getElementById('result-flash');
-        flash.textContent = `+${pts}`;
-        flash.style.color = 'var(--c-gold)';
-        flash.style.animation = 'none';
-        setTimeout(()=>flash.style.animation = 'slideUp 0.5s forwards',10);
-        
+        if(flash) {
+          flash.textContent = `+${pts}pt!`;
+          flash.style.animation = 'none';
+          setTimeout(() => flash.style.animation = 'slideUp 0.5s forwards', 10);
+        }
         setTimeout(nextRound, 1000);
       };
-    }, Math.random()*2000 + 500);
+    }, Math.random() * 1500 + 600);
   };
   nextRound();
-}
-
-function playRoulette() {
-  const container = document.getElementById('game-container');
-  container.innerHTML = `<div class="empty-state"><h3>🎲 랜덤 점수 배정 중...</h3></div>`;
-  setTimeout(() => {
-    state.gameScores = {};
-    state.students.forEach(s => state.gameScores[s.id] = Math.floor(Math.random()*100));
-    finishGame();
-  }, 2000);
 }
 
 function updateGameScores() {
   const bar = document.getElementById('game-scores');
   if(!bar) return;
-  const sorted = Object.entries(state.gameScores).sort((a,b)=>b[1]-a[1]);
+  const sorted = Object.entries(state.gameScores).sort((a,b) => b[1] - a[1]);
   bar.innerHTML = sorted.map(entry => {
-    const s = state.students.find(x=>x.id == entry[0]);
+    const s = state.students.find(x => x.id == entry[0]);
     return `
-      <div class="score-chip ${entry[0]==state.me ? 'top':''}">
-        <span class="score-chip-name">${s.name}</span>
+      <div class="score-chip ${entry[0] == state.me ? 'top':''}">
+        <span class="score-chip-name">${s ? s.name : ''}</span>
         <span class="score-chip-score">${entry[1]}</span>
       </div>
     `;
   }).join('');
 }
 
-function finishGame() {
-  // Calc final rankings with bonus
-  const ranks = state.students.map(s => {
-    const base = state.gameScores[s.id] || 0;
-    const bns = s.bonus || 0;
-    return { studentId: s.id, score: base, bonus: bns, total: base + bns };
-  });
-  ranks.sort((a,b) => b.total - a.total);
-  state.gameRankings = ranks;
-  
-  showScreen('ranking');
-  const rCont = document.getElementById('ranking-container');
-  rCont.innerHTML = ranks.map((r, i) => {
-    const s = state.students.find(x=>x.id === r.studentId);
-    let medal = '';
-    if(i===0) medal='🥇'; else if(i===1) medal='🥈'; else if(i===2) medal='🥉';
-    return `
-      <div class="rank-item">
-        <div class="rank-pos">${i+1}</div>
-        <div class="rank-name">${s.name}</div>
-        ${r.bonus > 0 ? `<div class="rank-bonus">가산점 +${r.bonus}</div>` : ''}
-        <div class="rank-score">${r.total}점</div>
-        <div class="rank-medal">${medal}</div>
-      </div>
-    `;
-  }).join('');
-}
-
 // ==========================================
-// 7. SEAT PICKING
-// ==========================================
-window.startSeatPick = () => {
-  state.currentPickIndex = 0;
-  // Initialize seats status
-  state.layout.seats.forEach(s => { s.status = 'available'; s.occupantId = null; });
-  showScreen('seat-pick');
-  updateSeatPickUI();
-  processNextPick();
-};
-
-function updateSeatPickUI() {
-  // Sidebar queue
-  const q = document.getElementById('pick-queue');
-  q.innerHTML = state.gameRankings.map((r, idx) => {
-    const s = state.students.find(x=>x.id === r.studentId);
-    const cls = idx === state.currentPickIndex ? 'current' : idx < state.currentPickIndex ? 'done' : '';
-    return `<div class="pick-queue-item ${cls}"><span class="pick-queue-rank">${idx+1}</span><span class="pick-queue-name">${s.name}</span></div>`;
-  }).join('');
-  
-  // Grid
-  const grid = document.getElementById('classroom-grid');
-  grid.innerHTML = state.layout.seats.map(seat => {
-    const isMe = seat.occupantId === state.me;
-    let cls = 'available';
-    if(seat.status === 'taken') cls = isMe ? 'taken-by-me' : 'taken';
-    let content = '';
-    if(seat.occupantId) {
-      const occ = state.students.find(x=>x.id === seat.occupantId);
-      const emoji = occ ? (occ.gender === 'M' ? '👦' : '👧') : '👶';
-      content = `<span class="seat-occupant-emoji">${emoji}</span><span class="seat-occupant">${occ ? occ.name : ''}</span>`;
-    }
-    return `
-      <div class="seat-cell ${cls}" onclick="pickSeat('${seat.id}')">
-        <span class="seat-num">${seat.r*state.layout.cols + seat.c + 1}</span>
-        ${content}
-      </div>
-    `;
-  }).join('');
-  
-  const currentRank = state.gameRankings[state.currentPickIndex];
-  if(!currentRank) return; // Done
-  
-  if(currentRank.studentId === state.me) {
-    document.getElementById('pick-turn-badge').textContent = '내 차례입니다!';
-    document.getElementById('pick-turn-badge').className = 'student-header-badge badge badge-accent';
-  } else {
-    const s = state.students.find(x=>x.id === currentRank.studentId);
-    document.getElementById('pick-turn-badge').textContent = `${s.name} 선택 중...`;
-    document.getElementById('pick-turn-badge').className = 'student-header-badge badge badge-primary';
-  }
-}
-
-function processNextPick() {
-  const currentRank = state.gameRankings[state.currentPickIndex];
-  if(!currentRank) {
-    // All picked
-    setTimeout(showReveal, 1000);
-    return;
-  }
-  
-  if(currentRank.studentId !== state.me) {
-    // Simulate other student picking after 1.5s
-    setTimeout(() => {
-      const avail = state.layout.seats.filter(s=>s.status === 'available');
-      if(avail.length > 0) {
-        const randSeat = avail[Math.floor(Math.random() * avail.length)];
-        executePick(randSeat.id, currentRank.studentId);
-      }
-    }, 1500);
-  }
-}
-
-window.pickSeat = (seatId) => {
-  const currentRank = state.gameRankings[state.currentPickIndex];
-  if(currentRank.studentId !== state.me) {
-    showToast('아직 내 차례가 아닙니다!', 'warning');
-    return;
-  }
-  const seat = state.layout.seats.find(s=>s.id === seatId);
-  if(seat.status !== 'available') {
-    showToast('이미 선택된 자리입니다.', 'error');
-    return;
-  }
-  executePick(seatId, state.me);
-};
-
-function executePick(seatId, studentId) {
-  const seat = state.layout.seats.find(s=>s.id === seatId);
-  seat.status = 'taken';
-  seat.occupantId = studentId;
-  
-  state.currentPickIndex++;
-  updateSeatPickUI();
-  processNextPick();
-}
-
-// ==========================================
-// 8. REVEAL
+// 10. REVEAL & CELEBRATION
 // ==========================================
 function showReveal() {
   showScreen('reveal');
   const grid = document.getElementById('reveal-classroom');
   grid.innerHTML = state.layout.seats.map((seat, i) => {
     let content = '';
-    if(seat.occupantId) {
-      const occ = state.students.find(x=>x.id === seat.occupantId);
-      const emoji = occ ? (occ.gender === 'M' ? '👦' : '👧') : '👶';
-      content = `<span class="reveal-seat-emoji">${emoji}</span><span>${occ ? occ.name : ''}</span>`;
+    const occ = state.students.find(x => x.id === seat.occupantId);
+    const isMe = occ && occ.id === state.me;
+    if(occ) {
+      const emoji = occ.gender === 'M' ? '👦' : '👧';
+      content = `
+        <span class="reveal-seat-emoji">${emoji}</span>
+        <span style="font-weight:700;${isMe ? 'color:var(--c-gold);font-size:1.15rem;':''}">${occ.name}</span>
+      `;
     }
-    return `<div class="reveal-seat" style="animation-delay:${i*0.1}s">${content}</div>`;
+    return `
+      <div class="reveal-seat ${isMe ? 'taken-by-me':''}" style="animation-delay:${i*0.06}s; height:75px; background:var(--c-surface2); border:1px solid var(--c-border2); border-radius:12px; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+        ${content}
+      </div>
+    `;
   }).join('');
   
-  setTimeout(() => {
-    const seats = document.querySelectorAll('.reveal-seat');
-    seats.forEach(s => s.classList.add('revealed'));
-    fireConfetti();
-  }, 500);
+  fireConfetti();
 }
 
 function fireConfetti() {
-  for(let i=0; i<50; i++) {
+  for(let i=0; i<40; i++) {
     const p = document.createElement('div');
     p.className = 'confetti-piece';
     p.style.left = `${Math.random()*100}vw`;
     p.style.backgroundColor = `hsl(${Math.random()*360}, 100%, 60%)`;
     p.style.animationDuration = `${Math.random()*2+2}s`;
     document.body.appendChild(p);
-    setTimeout(()=>p.remove(), 4000);
+    setTimeout(() => p.remove(), 4000);
   }
 }
 
+// Group Balance UI
+function renderGroupsUI() {
+  const content = document.getElementById('admin-content-area');
+  if(!content) return;
+  if(state.groups.length === 0) generateGenderBalancedGroups(5);
+  
+  content.innerHTML = `
+    <div class="admin-page active">
+      <div class="admin-page-header" style="display:flex;justify-content:space-between;align-items:center;">
+        <div>
+          <h1>⚖️ 남녀 밸런스 모둠 편성</h1>
+          <p>모둠별 남녀 비율을 균등하게 자동 배치합니다.</p>
+        </div>
+        <button class="btn btn-primary" onclick="generateGenderBalancedGroups(5)">⚡ 5모둠 재편성</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(260px, 1fr));gap:16px;margin-top:20px;">
+        ${state.groups.map(g => `
+          <div class="card" style="background:var(--c-surface2);">
+            <h3 style="color:var(--c-gold);margin-bottom:10px;">${g.name}</h3>
+            ${g.members.map(m => `
+              <div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.06);">
+                <span>${m.name}</span>
+                <span class="gender-tag ${m.gender==='M'?'male':'female'}">${m.gender==='M'?'남':'여'}</span>
+              </div>
+            `).join('')}
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function generateGenderBalancedGroups(groupCount = 5) {
+  const males = state.students.filter(s => s.gender === 'M');
+  const females = state.students.filter(s => s.gender === 'F');
+  const groups = Array.from({ length: groupCount }, (_, i) => ({ id: i+1, name: `${i+1}모둠`, members: [] }));
+  
+  males.forEach((m, idx) => groups[idx % groupCount].members.push(m));
+  females.forEach((f, idx) => groups[idx % groupCount].members.push(f));
+  state.groups = groups;
+}
+
 // ==========================================
-// BOOTSTRAP
+// 11. BOOTSTRAP & URL PARAM CHECK
 // ==========================================
 document.addEventListener('DOMContentLoaded', () => {
   renderLobby();
-  showScreen('lobby');
+  
+  const params = new URLSearchParams(window.location.search);
+  const urlRoom = params.get('room');
+  if(urlRoom) {
+    joinStudentRoom(urlRoom);
+  } else {
+    showScreen('lobby');
+  }
 });
